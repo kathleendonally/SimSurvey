@@ -1,3 +1,4 @@
+# TODO: switched from age-based sampling to length-based
 
 #' Closure for simulating logistic curve
 #'
@@ -205,10 +206,26 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
 
   ## Round simulated population and calculate numbers available to survey
   sim <- round_sim(sim)
-  I <- sim$N * q(replicate(length(sim$years), sim$ages))
-  I_at_length <- convert_N(N_at_age = I,
-                           lak = sim$sim_length(age = sim$ages, length_age_key = TRUE))
-  sim$sp_N$I <- sim$sp_N$N * q(sim$sp_N$age)
+
+  ## Expand age-based abundance to individual fish, one row per fish
+  sp_pop <- as.data.table(sim$sp_N)
+  sp_pop <- sp_pop[rep(seq_len(.N), round(N))]
+  sp_pop$sim <- 1 #not looping sims?
+
+
+
+  ## Assign biological length
+  sp_pop$length<- sim$sim_length(sp_pop$age)
+  sp_pop$length <- group_lengths(sp_pop$length, age_length_group)
+
+  ## Join with spatial grid info
+  grid_info <- as.data.table(sim$grid)
+  sp_pop <- merge(sp_pop, grid_info[,.(cell, x, y, depth, strat, division, cell_area)], by="cell", all.x=TRUE)
+
+  # I <- sim$N * q(replicate(length(sim$years), sim$ages))
+  # I_at_length <- convert_N(N_at_age = I,
+  #                          lak = sim$sim_length(age = sim$ages, length_age_key = TRUE))
+  # sim$sp_N$I <- sim$sp_N$N * q(sim$sp_N$age)
 
   ## Simulate sets conducted across survey grid
   if (is.null(custom_sets)) {
@@ -222,37 +239,73 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   }
   setkeyv(sets, c("sim", "year", "cell"))
 
-  ## Expand sp_N object n_sim times
-  sp_I <- data.table(sim$sp_N[, c("cell", "age", "year", "N")])
-  i <- rep(seq(nrow(sp_I)), times = n_sims)
-  s <- rep(seq(n_sims), each = nrow(sp_I))
-  sp_I <- sp_I[i, ]
-  sp_I$sim <- s
+  ## Merge all data for population
+  sp_pop <- merge(sp_pop, sets[, .(set, sim, year, cell, tow_area, cell_area, cell_sets)],
+                  by=c("sim","year","cell"),
+                  all.x = FALSE, allow.cartesian = TRUE)
 
-  ## Subset population to surveyed cells and simulate portion caught by survey
-  ## Introduce sampling error using rbinom
-  ## (If more than one set is conducted in a cell, split population available to survey (I) amongst the sets)
-  setdet <- merge(sets, sp_I, by = c("sim", "year", "cell"))
-  if (binom_error) {
-    setdet$n <- stats::rbinom(rep(1, nrow(setdet)), size = round(setdet$N / setdet$cell_sets),
-                              prob = (setdet$tow_area / setdet$cell_area) * q(setdet$age))
-  } else {
-    setdet$n <- round((setdet$N / setdet$cell_sets) * ((setdet$tow_area / setdet$cell_area) * q(setdet$age)))
+  ## Catchability function as function of length
+  q_lfun <- sim_logistic(k=1.5, x0=20) # ADJUST
+
+  ## Compute catch probability for each fish
+  sp_pop$catch_prob <- (sp_pop$tow_area / sp_pop$cell_area) * q_lfun(sp_pop$length)
+
+  ## Simulate capture
+  sp_pop$caught <- rbinom(nrow(sp_pop), size=1, prob=sp_pop$catch_prob)
+  # DEBUGGING LINE
+  if (sum(sp_pop$caught) == 0) {
+    warning("No fish were caught. Check catchability settings.")
+    return(NULL)
   }
-  setkeyv(setdet, "set")
-  setkeyv(sets, "set")
-  rm(sp_I)
 
-  ## Expand set catch to individuals and simulate length
-  samp <- setdet[rep(seq(.N), n), list(set, age)]
-  samp$id <- seq(nrow(samp))
-  samp$length <- sim$sim_length(samp$age)
+  ## Subset to caught fish
+  samp <- sp_pop[caught == 1, .(set, age, length)]
+  samp$id <- seq_len(nrow(samp))
 
-  ## Sample lengths
-  measured <- samp[, list(id = id[sample(.N, ifelse(.N > lengths_cap, lengths_cap, .N),
-                                         replace = FALSE)]), by = "set"]
-  samp$measured <- samp$id %in% measured$id # tag lengths collected
-  length_samp <- samp[samp$measured, ]
+
+
+
+# ## COMMENTED OUT FOR HYBRID MODEL
+# ## Expand sp_N object n_sim times
+# sp_I <- data.table(sim$sp_N[, c("cell", "age", "year", "N")])
+# i <- rep(seq(nrow(sp_I)), times = n_sims)
+# s <- rep(seq(n_sims), each = nrow(sp_I))
+# sp_I <- sp_I[i, ]
+# sp_I$sim <- s
+#
+#   ## Subset population to surveyed cells and simulate portion caught by survey
+#   ## Introduce sampling error using rbinom
+#   ## (If more than one set is conducted in a cell, split population available to survey (I) amongst the sets)
+#   setdet <- merge(sets, sp_I, by = c("sim", "year", "cell"))
+#   if (binom_error) {
+#     setdet$n <- stats::rbinom(rep(1, nrow(setdet)), size = round(setdet$N / setdet$cell_sets),
+#                               prob = (setdet$tow_area / setdet$cell_area) * q(setdet$age))
+#   } else {
+#     setdet$n <- round((setdet$N / setdet$cell_sets) * ((setdet$tow_area / setdet$cell_area) * q(setdet$age)))
+#   }
+#   setkeyv(setdet, "set")
+#   setkeyv(sets, "set")
+#   rm(sp_I)
+#
+#   ## Expand set catch to individuals and simulate length
+#   samp <- setdet[rep(seq(.N), n), list(set, age)]
+#   samp$id <- seq(nrow(samp))
+#   samp$length <- sim$sim_length(samp$age)
+
+  ## Subsample measured lengths
+  # measured <- samp[, list(id = id[sample(.N, ifelse(.N > lengths_cap, lengths_cap, .N),
+  #                                        replace = FALSE)]), by = "set"]
+  ## Subsample measured lengths
+  measured <- samp[, if (.N > 0) .(id = sample(id, min(.N, lengths_cap))) else .(id = integer(0)), by = set]
+  samp$measured <- samp$id %in% measured$id
+
+  length_samp <- samp[samp$measured == TRUE, ]
+
+  # 🔐 Final guard before grouping lengths
+  if (nrow(length_samp) == 0 || all(is.na(length_samp$length)) || length(length_samp$length) == 0) {
+    warning("No valid lengths available for length grouping. Possibly no measured fish.")
+    return(NULL)
+  }
   rm(measured)
 
   ## Sample ages
@@ -276,12 +329,18 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   samp <- samp[, list(set, id, length, age, measured, aged)]
   if (light) samp$id <- NULL
 
-  ## Summarise set catch and sampling
-  if (!light) full_setdet <- setdet
-  setdet <- merge(sets, setdet[, list(N = sum(N), n = sum(n)), by = "set"], by = "set")
-  setdet <- merge(setdet,
-                  samp[, list(n_measured = sum(measured), n_aged = sum(aged)), by = "set"],
-                  by = "set", all.x = TRUE)
+  # ## Summarise set catch and sampling
+  # if (!light) full_setdet <- setdet
+  # setdet <- merge(sets, setdet[, list(N = sum(N), n = sum(n)), by = "set"], by = "set")
+  # setdet <- merge(setdet,
+  #                 samp[, list(n_measured = sum(measured), n_aged = sum(aged)), by = "set"],
+  #                 by = "set", all.x = TRUE)
+  # setdet$n_measured[is.na(setdet$n_measured)] <- 0
+  # setdet$n_aged[is.na(setdet$n_aged)] <- 0
+
+  ## New setdet based on hybrid sampling
+  setdet <- samp[, .(n = .N, n_measured = sum(measured), n_aged = sum(aged)), by="set"]
+  setdet <- merge(sets, setdet, by="set", all.x=TRUE)
   setdet$n_measured[is.na(setdet$n_measured)] <- 0
   setdet$n_aged[is.na(setdet$n_aged)] <- 0
 
@@ -290,10 +349,21 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
                                n_measured = sum(n_measured),
                                n_aged = sum(n_aged)), by = c("sim", "year")]
 
+
+  ## Estimate I and I_at_length from hybrid model (for diagnostics)
+  ## I_at_age is total available at age
+  I <- sim$N * q(sim$ages)
+  dim(I) <- dim(sim$N)
+  dimnames(I) <- dimnames(sim$N)
+
+  ## Convert to I_at_length using LAK
+  lak <- sim$sim_length(age = sim$ages, length_age_key = TRUE)
+  I_at_length <- convert_N(N_at_age=I, lak=lak)
+
   ## Add new stuff to main object
   sim$I <- I
   sim$I_at_length <- I_at_length
-  if (!light) sim$full_setdet <- full_setdet
+  # if (!light) sim$full_setdet <- full_setdet
   sim$setdet <- setdet
   sim$samp <- samp
   sim$samp_totals <- samp_totals
