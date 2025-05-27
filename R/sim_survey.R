@@ -214,7 +214,7 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   ## Round simulated population and calculate numbers available to survey
   sim <- round_sim(sim)
 
-  ## Expand sp_N to simulate individual fish based on age-abundance
+  ## Expand age-based abundance to individual fish, one row per fish
   sp_N <- as.data.table(sim$sp_N)[round(N) > 0]
   n_row <- nrow(sp_N)
   sp_N <- sp_N[rep(1:.N, times = n_sims)]
@@ -247,9 +247,7 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
                 by = c("sim","year","cell"))
 
   ## Catchability function as function of length
-  q_lfun <- sim_logistic(k=1.5, x0=20) # ADJUST
-
-  ## Determine catchability based on length and save data for caught fish only
+  q_lfun <- sim_logistic(k=0.5, x0=20) # based on grid search with RMSE
   samp_list <- lapply(1:nrow(sp_N), function(i) {
     row <- sp_N[i]
     N_fish <- round(row$N)
@@ -274,9 +272,7 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   samp <- rbindlist(samp_list)
   samp$id <- seq_len(nrow(samp))
 
-  ## Subsample measured lengths per set, up to lengths_cap
-  ## Subsample AGES from measured fish, stratified by age_space_group and length_group\
-  ## NOTE: length-based sampling may bias age structure? tracking age for diagnostic
+  ## Subsample measured lengths
   measured <- samp[, if (.N > 0) .(id = sample(id, min(.N, lengths_cap))) else .(id = integer(0)), by = set]
   samp$measured <- samp$id %in% measured$id
   length_samp <- samp[samp$measured == TRUE, ]
@@ -284,7 +280,8 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
 
   ## Sample ages
   length_samp$length_group <- group_lengths(length_samp$length, age_length_group)
-  length_samp <- merge(sets[, list(set, sim, year, division, strat)], length_samp, by = "set")
+  length_samp <- merge(length_samp, sets[, .(set, year, division, strat)],
+                       by = "set", all.x = TRUE)
 
   if (age_sampling == "stratified") {
     aged <- length_samp[, list(id = id[sample(.N, ifelse(.N > ages_cap, ages_cap, .N),
@@ -296,27 +293,24 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
                                               replace = FALSE)]),
                         by = c("set")]
   }
+
+
+  ## Add back length_group to main sample
+  samp <- merge(samp, length_samp[, .(id, length_group)], by = "id", all.x = TRUE)
+
   samp$aged <- samp$id %in% aged$id # tag ages sampled
   rm(aged)
   rm(length_samp)
+  samp$length_group <- NULL # remove length_group to avoid conflict with plot_survey
 
   ## Simplify samp object
-  samp <- samp[, list(set, sim, id, length, age, measured, aged)]
+  samp <- merge(samp, sets[, .(set, sim, year)], by = c("set", "sim"), all.x = TRUE)
+  samp <- samp[, list(set, sim, year, id, length, age, measured, aged)]
   if (light) samp$id <- NULL
 
-  # ## Summarise set catch and sampling
-  # if (!light) full_setdet <- setdet
-  # setdet <- merge(sets, setdet[, list(N = sum(N), n = sum(n)), by = "set"], by = "set")
-  # setdet <- merge(setdet,
-  #                 samp[, list(n_measured = sum(measured), n_aged = sum(aged)), by = "set"],
-  #                 by = "set", all.x = TRUE)
-  # setdet$n_measured[is.na(setdet$n_measured)] <- 0
-  # setdet$n_aged[is.na(setdet$n_aged)] <- 0
-
-  ## Summarize set-level sampling: total caught, measured, aged
-  ## Ensure sim is preserved in grouping to support multiple simulation runs
-  setdet <- samp[, .(n = .N, n_measured = sum(measured), n_aged = sum(aged)), by=.(sim, set)]
-  setdet <- merge(sets[, .(set, sim, year, division, strat, x, y)], setdet, by=c("sim","set"), all.x=TRUE)
+  ## New setdet based on hybrid sampling
+  setdet <- samp[, .(n = .N, n_measured = sum(measured), n_aged = sum(aged)), by= "set"]
+  setdet <- merge(sets[, .(set, sim, year, division, strat, x, y)], setdet, by="set", all.x=TRUE)
   setdet$n_measured[is.na(setdet$n_measured)] <- 0
   setdet$n_aged[is.na(setdet$n_aged)] <- 0
   setdet$n[is.na(setdet$n)] <- 0
@@ -329,7 +323,8 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   ), by = .(sim, year)]
 
 
-  ## Estimate I and I_at_length from hybrid model (for bias/RMSE)
+  ## Estimate I and I_at_length from hybrid model (for diagnostics)
+  ## I_at_age is total available at age
   I <- sim$N * q(sim$ages)
   dim(I) <- dim(sim$N)
   dimnames(I) <- dimnames(sim$N)
@@ -345,10 +340,11 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   sim$setdet <- setdet
   sim$samp <- samp
   sim$samp_totals <- samp_totals
+
+  sim$sets <- sets
   sim
 
 }
-
 
 
 #' Simulate stratified random surveys using parallel computation
