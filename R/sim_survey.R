@@ -191,12 +191,22 @@ sim_sets <- function(sim, subset_cells, n_sims = 1, trawl_dim = c(1.5, 0.02),
 #' @export
 #'
 
-sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0.02),
-                       resample_cells = FALSE, binom_error = TRUE,
-                       min_sets = 2, set_den = 2 / 1000, lengths_cap = 500,
-                       ages_cap = 10, age_sampling = "stratified",
-                       age_length_group = 1, age_space_group = "division",
-                       custom_sets = NULL, light = TRUE) {
+sim_survey <- function(sim, n_sims = 1,
+                       q = sim_logistic(),
+                       q_length = sim_logistic(k=0.2, x0=20),
+                       trawl_dim = c(1.5, 0.02),
+                       resample_cells = FALSE,
+                       binom_error = TRUE,
+                       min_sets = 2,
+                       set_den = 2 / 1000, lengths_cap = 500,
+                       ages_cap = 10,
+                       age_sampling = "stratified",
+                       age_length_group = 1,
+                       select_by_age = TRUE,
+                       length_bin_width = 3,
+                       age_space_group = "division",
+                       custom_sets = NULL,
+                       light = TRUE) {
 
   n <- age <- id <- division <- strat <- N <- n_measured <- n_aged <- NULL
 
@@ -220,6 +230,7 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   sp_N <- sp_N[rep(1:.N, times = n_sims)]
   sp_N[, sim := rep(seq_len(n_sims), each = .N / n_sims)]
 
+
   ## Rejoin spatial grid info
   grid_info <- as.data.table(sim$grid)
 
@@ -227,7 +238,7 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   cell_area_val <- prod(as.numeric(stars::st_res(sim$grid)))
   grid_info[, cell_area := cell_area_val]
 
-  sp_N <- merge(sp_N, grid_info[, .(cell, x, y, depth, strat, division, cell_area)],
+  sp_N <- merge(sp_N, grid_info[, .(cell, cell_area)],
                 by = "cell", all.x = TRUE)
 
   ## Simulate sets conducted across survey grid
@@ -242,12 +253,24 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   }
   setkeyv(sets, c("sim", "year", "cell"))
 
-
+  ## Merge sp_N with sets to assign sampling info
   sp_N <- merge(sp_N, sets[, .(sim, year, cell, set, tow_area, cell_sets, x, y)],
                 by = c("sim","year","cell"))
 
-  ## Catchability function as function of length
-  q_lfun <- sim_logistic(k=0.5, x0=20) # based on grid search with RMSE
+  ## Initialize I_at_length tally
+  years <- unique(sp_N$year)
+
+  length_bins <- seq(0, max(sim$sim_length(sim$ages)), by=length_bin_width)
+
+  length_labels <- levels(cut(0, length_bins, include.lowest=TRUE, right=FALSE))
+
+  # Initialize tallies as matrices (length bins × years) and (ages × years)
+  I_at_length <- matrix(0, nrow=length(length_labels), ncol=length(years),
+                        dimnames=list(length=length_labels, year=as.character(years)))
+
+
+  # q_lfun <- sim_logistic(k=0.5, x0=20)
+  # Sampling loop over each population cell
   samp_list <- lapply(1:nrow(sp_N), function(i) {
     row <- sp_N[i]
     N_fish <- round(row$N)
@@ -255,10 +278,18 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
 
     # Simulate individual ages
     ages <- rep(row$age, N_fish)
-    lengths <- sim$sim_length(ages)
-    catch_probs <- (row$tow_area / row$cell_area) * q_lfun(lengths)
-    caught <- rbinom(N_fish, 1, catch_probs)
+    lengths <- sim$sim_length(rep(row$age, N_fish))  # Double-check this returns length N_fish, default cv 0.1
+    year <- as.character(row$year)
 
+    # Tally population at length
+    binned_lengths <- cut(lengths, breaks=length_bins, include.lowest=TRUE, right=FALSE)
+    len_table <- table(binned_lengths)
+    I_at_length[names(len_table), year] <- I_at_length[names(len_table), year] + as.numeric(len_table)
+
+    ## Simulate catch
+    tow_ratio <- as.numeric(row$tow_area) / as.numeric(row$cell_area)
+    catch_probs <- tow_ratio * q_length(lengths)
+    caught <- rbinom(N_fish, 1, catch_probs)
     if (sum(caught) == 0) return(NULL)
 
     data.table(
@@ -297,18 +328,19 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
 
   ## Add back length_group to main sample
   samp <- merge(samp, length_samp[, .(id, length_group)], by = "id", all.x = TRUE)
-
   samp$aged <- samp$id %in% aged$id # tag ages sampled
   rm(aged)
   rm(length_samp)
+
   samp$length_group <- NULL # remove length_group to avoid conflict with plot_survey
+  if (light) samp$id <- NULL
+
 
   ## Simplify samp object
   samp <- merge(samp, sets[, .(set, sim, year)], by = c("set", "sim"), all.x = TRUE)
   samp <- samp[, list(set, sim, year, id, length, age, measured, aged)]
-  if (light) samp$id <- NULL
 
-  ## New setdet based on hybrid sampling
+  ## Create setdet based on hybrid sampling
   setdet <- samp[, .(n = .N, n_measured = sum(measured), n_aged = sum(aged)), by= "set"]
   setdet <- merge(sets[, .(set, sim, year, division, strat, x, y)], setdet, by="set", all.x=TRUE)
   setdet$n_measured[is.na(setdet$n_measured)] <- 0
@@ -323,27 +355,25 @@ sim_survey <- function(sim, n_sims = 1, q = sim_logistic(), trawl_dim = c(1.5, 0
   ), by = .(sim, year)]
 
 
-  ## Estimate I and I_at_length from hybrid model (for diagnostics)
-  ## I_at_age is total available at age
-  I <- sim$N * q(sim$ages)
-  dim(I) <- dim(sim$N)
-  dimnames(I) <- dimnames(sim$N)
+  ## work out how to apply catchability at length to generate pop available to survey at length
+  # supply N_at_age = N to get N_at_length, but need q_adj , N*q_l
 
   ## Convert to I_at_length using LAK
   lak <- sim$sim_length(age = sim$ages, length_age_key = TRUE)
-  I_at_length <- convert_N(N_at_age=I, lak=lak)
+  I <- sim$N * q(sim$ages)
+  I_at_length_det <- convert_N(N_at_age=I, lak=lak) # deterministic for comparison
 
-  ## Add new stuff to main object
-  sim$I <- I
+  # Store results
   sim$I_at_length <- I_at_length
-  # if (!light) sim$full_setdet <- full_setdet
+  sim$I_at_length_det <- I_at_length_det
+  sim$I <- I
   sim$setdet <- setdet
   sim$samp <- samp
   sim$samp_totals <- samp_totals
-
   sim$sets <- sets
   sim
 
+  # if (!light) sim$full_setdet <- full_setdet
 }
 
 
