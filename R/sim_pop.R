@@ -146,6 +146,17 @@ sim_N0 <- function(N0 = "exp", plot = FALSE) {
 #'
 
 group_lengths <- function(length, group) {
+
+  # Added to handle NA input
+  if (length(length) == 0 || all(is.na(length))) {
+    return(rep(NA, length(length)))
+  }
+
+  max_val <- max(length, na.rm = TRUE)
+  if (!is.finite(max_val)) {
+    return(rep(NA, length(length)))
+  }
+
   breaks <- seq(0, max(length, na.rm = TRUE) * 2, group)
   interval <- findInterval(length, breaks)
   l <- breaks[interval]
@@ -360,5 +371,36 @@ sim_abundance <- function(ages = 1:20, years = 1:20,
 
 }
 
+selectivity_integral <- function(sim, l50=15, l95=20, l_min=0, l_max = 100){
+
+  ## Define logistic selectivity function based on l50 and l95
+  q_length <- function(length) {
+  k <- log(19) / (l95 - l50)  # Steepness
+  x0 <- l50  # Midpoint
+  1 / (1 + exp(-k * (length - x0)))
+  }
+
+  ## Define probability density function for length given age with sim$sim_length
+  prob_len_given_age <- function(length, age){
+    len_mean <- sim$sim_length(age) # return mean length at age
+    len_sd <- sim$sim_length(age, cv=0.1)
+    dnorm(length, mean=len_mean, sd=len_sd)
+  }
+
+  ## Integrate selectivity * P(length|age) over length
+  I_at_age <- sapply(sim$ages, function(age){
+    integral <- integrate(
+      f=function(l) q_length(l) * prob_len_given_age(l, age),
+      lower = l_min,
+      upper = l_max
+    )$value
+    integral
+    })
+
+  ## Multiply by total abundance at age for each year
+  I_at_age <- sim$N * matrix(I_at_age, nrow=length(sim$ages), ncol=length(sim$years))
+
+  return(I_at_age)
+  }
 
 
