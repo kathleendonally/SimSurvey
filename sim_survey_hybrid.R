@@ -33,59 +33,6 @@ sim_logistic <- function(k = 2, x0 = 3, plot = FALSE) {
   }
 }
 
-#' Function for deterministic distribution of I_at_length
-#'
-#' @description This function ...
-
-selectivity_integral <- function(sim, l50=15, l95=20, cv = 0.1){
-
-  ## Define logistic selectivity function based on l50 and l95
-  q_length <- function(length) {
-    k <- log(19) / (l95 - l50)  # Steepness
-    x0 <- l50  # Midpoint
-    1 / (1 + exp(-k * (length - x0)))
-  }
-
-  ## Define probability density function for length given age with sim$sim_length
-  prob_len_given_age <- function(length, age){
-    len_mean <- sim$sim_length(age) # return mean length at age
-    len_sd <- len_mean * cv
-    dnorm(length, mean=len_mean, sd=len_sd)
-  }
-
-  # Reconstruct length bins from the simulation’s length-age key
-  lak <- sim$sim_length(age = sim$ages, length_age_key = TRUE)
-  bin_midpoints <- as.numeric(rownames(lak))
-  bin_width <- diff(bin_midpoints)[1]
-  length_bins <- c(0, bin_midpoints + bin_width / 2)
-
-  # Initialize output matrix
-  years <- sim$years
-  I_at_length_det <- matrix(0,
-                            nrow = length(bin_midpoints),
-                            ncol = length(years),
-                            dimnames = list(length = as.character(bin_midpoints),
-                                            year = as.character(years)))
-
-  # Loop over bins and ages
-  for (age in sim$ages) {
-    for (i in seq_along(length_bins)[-length(length_bins)]) {
-      bin_lower <- length_bins[i]
-      bin_upper <- length_bins[i + 1]
-
-      integral <- integrate(
-        function(l) q_length(l) * prob_len_given_age(l, age),
-        lower = bin_lower, upper = bin_upper
-      )$value
-
-      I_at_length_det[i, ] <- I_at_length_det[i, ] + sim$N[as.character(age), ] * integral
-    }
-  }
-
-  return(I_at_length_det)
-}
-
-
 #' Round simulated population
 #'
 #' @param sim Simulation from \code{\link{sim_distribution}}
@@ -369,7 +316,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                     by = "set", all.x = TRUE)
   } else {
 
-    ### SAMPLE BY LENGTH ###
+    #################################### SAMPLE BY LENGTH ####################################
 
     ## Expand age-based abundance to individual fish, one row per fish
     sp_N <- as.data.table(sim$sp_N)[round(N) > 0]
@@ -388,10 +335,11 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
 
     ## Merge sp_N with sets to assign sampling info
     sp_N <- merge(sp_N, sets[, .(sim, year, cell, set, tow_area, cell_sets, x, y, division, strat)],
-                  by = c("sim","year","cell"))
+                  by = c("sim","year","cell"), allow.cartesian = TRUE)
 
     ## Initialize I_at_length tally
     length_labels <- as.numeric(rownames(lak))
+    q_vec <- q_length(length_labels)  # Selectivity at length bin midpoints
     length_bins <- c(0, unique(sort(length_labels + diff(length_labels)[1]/2)))  # define breaks
 
     # Initialize tallies as matrices (length bins × years) and (ages × years)
@@ -407,9 +355,11 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
       N_fish <- round(row$N)
       if (N_fish == 0) return(NULL)
 
-      # Simulate individual ages
+      # Simulate individuals
       ages <- rep(row$age, N_fish)
-      lengths <- sim$sim_length(ages)
+      lengths <- sim$sim_length(ages
+                                # , length_age_key=TRUE
+                                )
       year <- as.character(row$year)
 
       # Bin by numeric lower bounds
@@ -475,10 +425,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     sim$N <- tapply(round(sim$sp_N$N),
                     list(age = sim$sp_N$age, year = sim$sp_N$year),
                     sum, default = 0)
-
-    sim$sp_N$I <- sim$sp_N$N * q(sim$sp_N$age)
-
-    sim$I_at_length_det <- selectivity_integral(sim, l50=l50, l95=l95)
   }
 
   setdet$n_measured[is.na(setdet$n_measured)] <- 0
