@@ -238,6 +238,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
   setkeyv(sets, c("sim", "year", "cell"))
   lak <- sim$sim_length(age = sim$ages, length_age_key = TRUE)
 
+  # availability at age
   I <- sim$N * q(replicate(length(sim$years), sim$ages))
 
   if (select_by_age ==TRUE) {
@@ -318,75 +319,97 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
 
     #################################### SAMPLE BY LENGTH ####################################
 
-    ## Expand age-based abundance to individual fish, one row per fish
-    sp_N <- as.data.table(sim$sp_N)[round(N) > 0]
-    sp_N <- sp_N[rep(1:.N, times = n_sims)]
-    sp_N[, sim := rep(seq_len(n_sims), each = .N / n_sims)]
-
-    ## Rejoin spatial grid info
-    grid_info <- as.data.table(sim$grid)
-
-    ## Add cell_area from grid resolution
-    cell_area_val <- prod(as.numeric(stars::st_res(sim$grid)))
-    grid_info[, cell_area := cell_area_val]
-
-    sp_N <- merge(sp_N, grid_info[, .(cell, cell_area)],
-                  by = "cell", all.x = TRUE)
-
-    ## Merge sp_N with sets to assign sampling info
-    sp_N <- merge(sp_N, sets[, .(sim, year, cell, set, tow_area, cell_sets, x, y, division, strat)],
-                  by = c("sim","year","cell"), allow.cartesian = TRUE)
-
     ## Initialize I_at_length tally
-    length_labels <- as.numeric(rownames(lak))
-    q_vec <- q_length(length_labels)  # Selectivity at length bin midpoints
-    length_bins <- c(0, unique(sort(length_labels + diff(length_labels)[1]/2)))  # define breaks
+    q_vals <- q_length(as.numeric(rownames(lak)))
+    q_lak <- sweep(lak, 1, q_vals, `*`)  # q(length) * p(length | age)
+    I_at_length <- q_lak %*% sim$N
+    dimnames(I_at_length) <- list(length = rownames(q_lak), year = colnames(sim$N))
 
-    # Initialize tallies as matrices (length bins × years) and (ages × years)
-    I_at_length <- matrix(0,
-                          nrow = length(length_labels),
-                          ncol = length(unique(sp_N$year)))
-    dimnames(I_at_length) <- list(length = as.character(length_labels),
-                                  year = as.character(unique(sp_N$year)))
 
-    # Sampling loop over each population cell
-    samp_list <- lapply(1:nrow(sp_N), function(i) {
-      row <- sp_N[i]
+    I_at_length_det <- matrix(0,
+                              nrow = nrow(lak), # length bins as rows
+                              ncol = ncol(sim$N), # years as columns
+                              dimnames = list(rownames(lak), colnames(sim$N))
+    )
+
+    for (j in seq_len(ncol(sim$N))) { # loop over years
+      for (l in seq_len(nrow(lak))) { # loop over length bins
+        L <- as.numeric(rownames(lak))[l]
+        q_weighted <- lak[l, ] * q_length(rep(L, length(sim$ages)))
+        I_at_length_det[l, j] <- sum(sim$N[, j] * q_weighted)
+      }
+    }
+    sim$I_at_length_det <- I_at_length_det
+
+    ## Prepare sp_N only for sampled cells
+    sp_N <- as.data.table(sim$sp_N)[round(N) > 0]
+    n_sim <- length(unique(sets$sim))
+    sp_N <- sp_N[rep(seq_len(.N), times = n_sim)]
+    sp_N[, sim := rep(seq_len(n_sim), each = .N / n_sim)]
+
+    # Keep only sampled cells
+    cells_sampled <- unique(sets[, .(sim, year, cell)])
+    sp_N <- merge(sp_N, cells_sampled, by = c("sim", "year", "cell"))
+
+    ## adds cell area based on resolution for catchability scaling
+    grid_info <- as.data.table(sim$grid)
+    grid_info[, cell_area := prod(stars::st_res(sim$grid))]
+
+    # joins survey set info
+    sp_N <- merge(sp_N, grid_info[, .(cell, cell_area)], by = "cell", all.x = TRUE)
+    sp_N <- merge(sp_N, sets[, .(sim, year, cell, set, tow_area, cell_sets,
+                                 x, y, division, strat)],
+                  by = c("sim", "year", "cell"), allow.cartesian = TRUE)
+
+    # Pre-extract required objects for consistency
+    length_bins <- as.numeric(rownames(lak))  # same as used in I_at_length
+    q_l <- q_length(length_bins)              # selectivity at length bin midpoints
+    names(q_l) <- as.character(length_bins)
+
+    length_group_size <- get("length_group", envir = environment(sim$sim_length))
+
+    # Pre-compute P(l|a) for the loop
+    p_length_given_age <- setNames(
+                            lapply(unique(sp_N$age), function(a) lak[, as.character(a)]),
+                            as.character(unique(sp_N$age))
+                          )
+
+    samp_list <- vector("list", nrow(sp_N))
+
+    for (i in seq_len(nrow(sp_N))) {
+      if (i %% 500 == 0) message("Row ", i, "/", nrow(sp_N))
+
+      row <- as.list(sp_N[i])
       N_fish <- round(row$N)
-      if (N_fish == 0) return(NULL)
+      if (N_fish == 0) next
 
-      # Simulate individuals
-      ages <- rep(row$age, N_fish)
-      lengths <- sim$sim_length(ages
-                                # , length_age_key=TRUE
-                                )
-      year <- as.character(row$year)
+      age_char <- as.character(row$age)
+      p_length <- p_length_given_age[[age_char]]
 
-      # Bin by numeric lower bounds
-      binned_lengths <- cut(lengths,
-                            breaks = length_bins,
-                            labels = as.character(length_labels),
-                            include.lowest = TRUE,
-                            right = FALSE)
-      len_table <- table(binned_lengths)
-      I_at_length[names(len_table), year] <<- I_at_length[names(len_table), year] + as.numeric(len_table)
+      lengths <- sample(length_bins,
+                        size = N_fish,
+                        replace = TRUE,
+                        prob = p_length)
 
-      ## Simulate catch
-      tow_ratio <- as.numeric(row$tow_area) / as.numeric(row$cell_area)
-      catch_probs <- tow_ratio * q_length(lengths)
-      caught <- rbinom(N_fish, 1, catch_probs)
-      if (sum(caught) == 0) return(NULL)
+      catch_probs <- (row$tow_area / row$cell_area) * q_l[as.character(lengths)]
 
-      data.table(
+      # Skip rows with no realistic catch
+      if (max(catch_probs) < 1e-6) next
+
+      caught <- runif(N_fish) < pmin(1, catch_probs)
+      n_caught <- sum(caught)
+      if (n_caught == 0) next
+
+      samp_list[[i]] <- data.table(
         set = row$set,
         sim = row$sim,
         year = row$year,
         division = row$division,
         strat = row$strat,
-        age = ages[caught == 1],
-        length = lengths[caught == 1]
+        age = rep(row$age, n_caught),
+        length = lengths[caught]
       )
-    })
+    }
 
     samp <- rbindlist(samp_list)
     samp[, id := .I]
@@ -396,8 +419,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     measured <- samp[, if (.N > 0) .(id = sample(id, min(.N, lengths_cap)))
                      else .(id = integer(0)), by = set]
     samp[, measured := id %in% measured$id]
-
-    length_samp <- samp[samp$measured == TRUE, ]
+    length_samp <- samp[measured == TRUE]
     rm(measured)
 
     ## Sample ages
@@ -408,9 +430,9 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     }
     if (age_sampling == "random") {
       aged <- length_samp[, list(id = id[sample(.N, ifelse(.N > ages_cap, ages_cap, .N),
-                                                replace = FALSE)]),
-                          by = c("set")]
+                                                replace = FALSE)]), by = c("set")]
     }
+
     ## Tag ages sampled
     samp[, aged := id %in% aged$id]
     samp <- samp[, list(set, id, length, age, measured, aged)]
@@ -422,9 +444,9 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                     by = "set", all.x = TRUE)
     sim$I_at_length <- I_at_length
 
-    sim$N <- tapply(round(sim$sp_N$N),
-                    list(age = sim$sp_N$age, year = sim$sp_N$year),
-                    sum, default = 0)
+    # sim$N <- tapply(round(sim$sp_N$N),
+    #                 list(age = sim$sp_N$age, year = sim$sp_N$year),
+    #                 sum, default = 0)
   }
 
   setdet$n_measured[is.na(setdet$n_measured)] <- 0
@@ -443,6 +465,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
   sim$samp <- samp
   sim$sets <- sets
   rownames(sim$I_at_length) <- as.numeric(rownames(sim$I_at_length))
+  sim$sp_N
 
   return(sim)
 }
@@ -493,13 +516,13 @@ sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
   j <- loop <- new_set <- NULL
 
   start <- Sys.time()
-  one_res <- sim_survey(sim, n_sims = n_sims, light = TRUE, ...)
+  one_res <- sim_survey_hybrid(sim, n_sims = n_sims, light = TRUE, ...)
   end <- Sys.time()
   elapsed <- end - start
   max_dur <- end + (elapsed * n_loops) - start
 
   if (!quiet) {
-    message(paste("One run of sim_survey took ~",
+    message(paste("One run of sim_survey_hybrid took ~",
                   round(elapsed), attr(elapsed, "units"),
                   "to run. It may take up to",
                   round(max_dur), attr(max_dur, "units"),
@@ -509,8 +532,9 @@ sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
   cl <- makeCluster(cores) # use parallel computation
   registerDoParallel(cl)
   loop_res <- foreach(j = seq(n_loops),
-                      .packages = "SimSurvey") %dopar% {
-                        res <- sim_survey(sim, n_sims = n_sims, light = TRUE, ...)
+                      .packages = c("SimSurvey", "data.table"),
+                      .export = c("sim_survey_hybrid", "sim_logistic")) %dopar% {
+                        res <- sim_survey_hybrid(sim, n_sims = n_sims, light = TRUE, ...)
                         keep <- c("samp_totals", "setdet", "samp")
                         loop_res <- lapply(keep, function(nm) {
                           x <- res[[nm]]
@@ -523,9 +547,13 @@ sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
   stopCluster(cl) # stop parallel process
 
   ## Combine objects from loop
+  message("Combining samp_totals...")
   samp_totals <- data.table::rbindlist(lapply(loop_res, `[[`, "samp_totals"))
+  message("Combining setdet...")
   setdet <- data.table::rbindlist(lapply(loop_res, `[[`, "setdet"))
+  message("Combining samp...")
   samp <- data.table::rbindlist(lapply(loop_res, `[[`, "samp"))
+  message("Merge complete.")
 
   ## Fix numbering
   samp_totals$new_sim <- samp_totals$sim + (samp_totals$loop * n_sims - n_sims)
@@ -544,6 +572,7 @@ sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
   ## Add new stuff to main object
   sim$I <- one_res$I
   sim$I_at_length <- one_res$I_at_length
+  sim$I_at_length_det <- one_res$I_at_length_det
   sim$setdet <- setdet
   sim$samp <- samp
   sim$samp_totals <- samp_totals
