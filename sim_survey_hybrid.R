@@ -1,4 +1,4 @@
-# HYBRID SIM_SURVEY FUNCTION (updated June 12, 2025)
+# HYBRID SIM_SURVEY FUNCTION
 # Simulates trawl survey sampling by LENGTH (as in real surveys), while retaining true age.
 # Modifications:
 #     - simulate individuals based on abundance-at-age (sp_N)
@@ -95,48 +95,61 @@ round_sim <- function(sim) {
 
 sim_sets <- function(sim, subset_cells, n_sims = 1, trawl_dim = c(1.5, 0.02),
                      min_sets = 2, set_den = 2 / 1000,
-                     resample_cells = FALSE) {
+                     resample_cells = FALSE,
+                     between_tow_var = FALSE, # new toggle
+                     bt_cv = 0.08, # default CV for gamma distr
+                     bt_max_mult = 1.5) { # physical limit on trawl area
+    strat_sets <- cell_sets <- NULL
+    cells <- data.table(data.frame(sim$grid))
 
-  strat_sets <- cell_sets <- NULL
-  cells <- data.table(data.frame(sim$grid))
+    ## Replicate cells data.table for each year in the simulation
+    i <- rep(seq(nrow(cells)), times = length(sim$years))
+    y <- rep(sim$years, each = nrow(cells))
+    cells <- cells[i, ]
+    cells$year <- y
 
-  ## Replicate cells data.table for each year in the simulation
-  i <- rep(seq(nrow(cells)), times = length(sim$years))
-  y <- rep(sim$years, each = nrow(cells))
-  cells <- cells[i, ]
-  cells$year <- y
+    ## Replicate n_sims times
+    i <- rep(seq(nrow(cells)), times = n_sims)
+    s <- rep(seq(n_sims), each = nrow(cells))
+    cells <- cells[i, ]
+    cells$sim <- s
 
-  ## Replicate n_sims times
-  i <- rep(seq(nrow(cells)), times = n_sims)
-  s <- rep(seq(n_sims), each = nrow(cells))
-  cells <- cells[i, ]
-  cells$sim <- s
+    ## Subset cells for sampling
+    if (!missing(subset_cells)) {
+      r <- eval(substitute(subset_cells), cells)
+      cells <- cells[r,]
+    }
 
-  ## Subset cells for sampling
-  if (!missing(subset_cells)) {
-    r <- eval(substitute(subset_cells), cells)
-    cells <- cells[r,]
-  }
+    ## Strat area and sampling effort
+    strat_det <- cells[, list(strat_cells = .N), by = c("sim", "year", "strat")]
+    strat_det$cell_area <- prod(stars::st_res(sim$grid))
+    strat_det$strat_area <- strat_det$strat_cells * prod(stars::st_res(sim$grid))
+    strat_det$strat_sets <- round(strat_det$strat_area * set_den) # set allocation
+    strat_det$strat_sets[strat_det$strat_sets < min_sets] <- min_sets
+    cells <- merge(cells, strat_det, by = c("sim", "year", "strat"))
 
-  ## Strat area and sampling effort
-  strat_det <- cells[, list(strat_cells = .N), by = c("sim", "year", "strat")]
-  strat_det$tow_area <- prod(trawl_dim)
-  strat_det$cell_area <- prod(stars::st_res(sim$grid))
-  strat_det$strat_area <- strat_det$strat_cells * prod(stars::st_res(sim$grid))
-  strat_det$strat_sets <- round(strat_det$strat_area * set_den) # set allocation
-  strat_det$strat_sets[strat_det$strat_sets < min_sets] <- min_sets
-  cells <- merge(cells, strat_det, by = c("sim", "year", "strat"))
+    ## Simulate sets; randomly sample row id by group
+    ind <- cells[, .I[sample(.N, size = unique(strat_sets), replace = resample_cells)],
+                 by = c("sim", "year", "strat")][[4]]
+    sets <- cells[ind, ]
+    sets[, cell_sets := .N, by = c("sim", "year", "cell")] # useful for identifying cells with more than one set (when resample_units = TRUE)
+    sets$set <- seq(nrow(sets))
 
-  ## Simulate sets; randomly sample row id by group
-  ind <- cells[, .I[sample(.N, size = unique(strat_sets), replace = resample_cells)],
-               by = c("sim", "year", "strat")][[4]]
-  sets <- cells[ind, ]
-  sets[, cell_sets := .N, by = c("sim", "year", "cell")] # useful for identifying cells with more than one set (when resample_units = TRUE)
-  sets$set <- seq(nrow(sets))
-  sets
+    if (!between_tow_var) {
+    sets[, tow_area := prod(trawl_dim)]
+
+    } else {
+      # Generate a different tow_area per set via gamma distribution
+      mean_tow_area <- prod(trawl_dim)
+      shape <- 1 / bt_cv^2
+      scale <- 1 / shape
+      tow_mult <- rgamma(nrow(sets), shape = shape, scale = scale)
+      tow_mult <- pmin(pmax(tow_mult, 1 / bt_max_mult), bt_max_mult)  # optional clamping
+      sets[, tow_area := mean_tow_area * tow_mult]
+    }
+  return(sets)
 
 }
-
 
 #' Simulate stratified-random survey
 #'
@@ -207,7 +220,9 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                               length_max = 120,
                               age_space_group = "division",
                               custom_sets = NULL,
-                              light = TRUE) {
+                              light = TRUE,
+                              between_tow_var = FALSE,
+                              bt_cv = 0.08) {
 
   n <- age <- id <- division <- strat <- N <- n_measured <- n_aged <- NULL
 
@@ -227,8 +242,13 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
 
   ## Simulate sets conducted across survey grid
   if (is.null(custom_sets)) {
-    sets <- sim_sets(sim, resample_cells = resample_cells, n_sims = n_sims,
-                     trawl_dim = trawl_dim, set_den = set_den, min_sets = min_sets)
+    sets <- sim_sets(sim, resample_cells = resample_cells,
+                     n_sims = n_sims,
+                     trawl_dim = trawl_dim,
+                     set_den = set_den,
+                     min_sets = min_sets,
+                     between_tow_var = between_tow_var,
+                     bt_cv = bt_cv)
   } else {
     sets <- as.data.table(custom_sets)
     if (any(duplicated(sets$set))) {
@@ -248,7 +268,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     ## Deterministic from convert_N
     I_at_length <- convert_N(N_at_age = I, lak = lak)
     sim$I_at_length <- I_at_length
-
     sim$sp_N$I <- sim$sp_N$N * q(sim$sp_N$age)
 
     ## Expand sp_N object n_sim times
@@ -257,17 +276,25 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     s <- rep(seq(n_sims), each = nrow(sp_I))
     sp_I <- sp_I[i, ]
     sp_I$sim <- s
+
     ## Subset population to surveyed cells and simulate portion caught by survey
     ## Introduce sampling error using rbinom
-    ## (If more than one set is conducted in a cell, split population available to survey (I) amongst the sets)
+    ## (If more than one set is conducted in a cell, split population among sets)
     setdet <- merge(sets, sp_I, by = c("sim", "year", "cell"))
 
     if (binom_error) {
-      setdet$n <- stats::rbinom(rep(1, nrow(setdet)), size = round(setdet$N / setdet$cell_sets),
-                                prob = (setdet$tow_area / setdet$cell_area) * q(setdet$age))
+      setdet$n <- rbinom(
+        n = nrow(setdet),
+        size = round(setdet$N / pmax(setdet$cell_sets, 1)),  # avoid divide by 0
+        prob = pmin(setdet$tow_area / setdet$cell_area, 1) * q(setdet$age)
+      )
     } else {
-      setdet$n <- round((setdet$N / setdet$cell_sets) * ((setdet$tow_area / setdet$cell_area) * q(setdet$age)))
+      setdet$n <- round(
+        (setdet$N / pmax(setdet$cell_sets, 1)) *
+          pmin(setdet$tow_area / setdet$cell_area, 1) * q(setdet$age)
+      )
     }
+
     setkeyv(setdet, "set")
     setkeyv(sets, "set")
     rm(sp_I)
@@ -284,13 +311,12 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     length_samp <- samp[samp$measured, ]
     rm(measured)
 
-    ## Sample ages
-    # length_samp$length_group <- group_lengths(length_samp$length, age_length_group)
-    # length_samp <- merge(sets[, list(set, sim, year, division, strat)], length_samp,
-    #                      by = c("set", "sim", "year"))
     length_samp <- merge(sets[, .(set, sim, year, division, strat)], length_samp, by = "set")
+
+    ## Assign length groups
     length_samp$length_group <- group_lengths(length_samp$length, age_length_group)
 
+    ## Sample ages
     if (age_sampling == "stratified") {
       aged <- length_samp[, list(id = id[sample(.N, ifelse(.N > ages_cap, ages_cap, .N),
                                                 replace = FALSE)]),
@@ -377,7 +403,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     samp_list <- vector("list", nrow(sp_N))
 
     for (i in seq_len(nrow(sp_N))) {
-      if (i %% 500 == 0) message("Row ", i, "/", nrow(sp_N))
+      # if (i %% 500 == 0) message("Row ", i, "/", nrow(sp_N))
 
       row <- as.list(sp_N[i])
       N_fish <- round(row$N)
@@ -443,10 +469,9 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                                    n_aged = sum(aged)), by = "set"],
                     by = "set", all.x = TRUE)
     sim$I_at_length <- I_at_length
+    sim$q_length <- q_length
 
-    # sim$N <- tapply(round(sim$sp_N$N),
-    #                 list(age = sim$sp_N$age, year = sim$sp_N$year),
-    #                 sum, default = 0)
+
   }
 
   setdet$n_measured[is.na(setdet$n_measured)] <- 0
