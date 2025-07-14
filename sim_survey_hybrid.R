@@ -351,22 +351,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     I_at_length <- q_lak %*% sim$N
     dimnames(I_at_length) <- list(length = rownames(q_lak), year = colnames(sim$N))
 
-
-    I_at_length_det <- matrix(0,
-                              nrow = nrow(lak), # length bins as rows
-                              ncol = ncol(sim$N), # years as columns
-                              dimnames = list(rownames(lak), colnames(sim$N))
-    )
-
-    for (j in seq_len(ncol(sim$N))) { # loop over years
-      for (l in seq_len(nrow(lak))) { # loop over length bins
-        L <- as.numeric(rownames(lak))[l]
-        q_weighted <- lak[l, ] * q_length(rep(L, length(sim$ages)))
-        I_at_length_det[l, j] <- sum(sim$N[, j] * q_weighted)
-      }
-    }
-    sim$I_at_length_det <- I_at_length_det
-
     ## Prepare sp_N only for sampled cells
     sp_N <- as.data.table(sim$sp_N)[round(N) > 0]
     n_sim <- length(unique(sets$sim))
@@ -416,9 +400,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                         prob = p_length)
 
       catch_probs <- (row$tow_area / row$cell_area) * q_l[as.character(lengths)]
-
-      # # Skip rows with no realistic catch
-      # if (max(catch_probs) < 1e-6) next
 
       caught <- runif(N_fish) < pmin(1, catch_probs)
       n_caught <- sum(caught)
@@ -589,10 +570,10 @@ sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
   setnames(setdet, "new_set", "set")
   setnames(samp, "new_set", "set")
 
-  ## Add new stuff to main object
+  ## Add to main object
   sim$I <- one_res$I
   sim$I_at_length <- one_res$I_at_length
-  sim$I_at_length_det <- one_res$I_at_length_det
+  # sim$I_at_length_det <- one_res$I_at_length_det
   sim$setdet <- setdet
   sim$samp <- samp
   sim$samp_totals <- samp_totals
