@@ -70,14 +70,6 @@ strat_data <- function(sim, length_group = 3, alk_scale = "division") {
   lf <- lf[, list(length_freq = .N),
            by = c("set", "ratio", "length")]
   lf[, length_freq := length_freq / ratio] # scale frequencies
-
-  # record q_length to adjust I_hat if length-sampling is selected
-  if (!is.null(sim$q_length)) {
-    lf[, q_l := sim$q_length(as.numeric(as.character(length)))]
-    lf[, length_freq := length_freq / q_l]
-    lf[, q_l := NULL]
-  }
-
   lf[, ratio := NULL] # discard ratio column (no longer needed)
   setkeyv(lf, c("set", "length"))
 

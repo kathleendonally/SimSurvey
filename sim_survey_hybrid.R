@@ -403,8 +403,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     samp_list <- vector("list", nrow(sp_N))
 
     for (i in seq_len(nrow(sp_N))) {
-      # if (i %% 500 == 0) message("Row ", i, "/", nrow(sp_N))
-
       row <- as.list(sp_N[i])
       N_fish <- round(row$N)
       if (N_fish == 0) next
@@ -419,8 +417,8 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
 
       catch_probs <- (row$tow_area / row$cell_area) * q_l[as.character(lengths)]
 
-      # Skip rows with no realistic catch
-      if (max(catch_probs) < 1e-6) next
+      # # Skip rows with no realistic catch
+      # if (max(catch_probs) < 1e-6) next
 
       caught <- runif(N_fish) < pmin(1, catch_probs)
       n_caught <- sum(caught)
@@ -469,8 +467,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                                    n_aged = sum(aged)), by = "set"],
                     by = "set", all.x = TRUE)
     sim$I_at_length <- I_at_length
-    sim$q_length <- q_length
-
 
   }
 
@@ -490,7 +486,6 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
   sim$samp <- samp
   sim$sets <- sets
   rownames(sim$I_at_length) <- as.numeric(rownames(sim$I_at_length))
-  sim$sp_N
 
   return(sim)
 }
