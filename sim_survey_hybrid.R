@@ -95,10 +95,7 @@ round_sim <- function(sim) {
 
 sim_sets <- function(sim, subset_cells, n_sims = 1, trawl_dim = c(1.5, 0.02),
                      min_sets = 2, set_den = 2 / 1000,
-                     resample_cells = FALSE,
-                     between_tow_var = FALSE, # new toggle
-                     bt_cv = 0.08, # default CV for gamma distr
-                     bt_max_mult = 1.5) { # physical limit on trawl area
+                     resample_cells = FALSE) {
     strat_sets <- cell_sets <- NULL
     cells <- data.table(data.frame(sim$grid))
 
@@ -134,19 +131,8 @@ sim_sets <- function(sim, subset_cells, n_sims = 1, trawl_dim = c(1.5, 0.02),
     sets <- cells[ind, ]
     sets[, cell_sets := .N, by = c("sim", "year", "cell")] # useful for identifying cells with more than one set (when resample_units = TRUE)
     sets$set <- seq(nrow(sets))
-
-    if (!between_tow_var) {
     sets[, tow_area := prod(trawl_dim)]
 
-    } else {
-      # Generate a different tow_area per set via gamma distribution
-      mean_tow_area <- prod(trawl_dim)
-      shape <- 1 / bt_cv^2
-      scale <- 1 / shape
-      tow_mult <- rgamma(nrow(sets), shape = shape, scale = scale)
-      tow_mult <- pmin(pmax(tow_mult, 1 / bt_max_mult), bt_max_mult)  # optional clamping
-      sets[, tow_area := mean_tow_area * tow_mult]
-    }
   return(sets)
 
 }
@@ -205,24 +191,26 @@ sim_sets <- function(sim, subset_cells, n_sims = 1, trawl_dim = c(1.5, 0.02),
 
 sim_survey_hybrid <- function(sim, n_sims = 1,
                               q = sim_logistic(),
-                              q_length = sim_logistic(k=0.2, x0=20),
+                              # q_length = sim_logistic(k=0.589, x0=15),
                               trawl_dim = c(1.5, 0.02),
                               resample_cells = FALSE,
                               binom_error = TRUE,
                               min_sets = 2,
-                              set_den = 2 / 1000, lengths_cap = 500,
+                              set_den = 2 / 1000,
+                              lengths_cap = 500,
                               ages_cap = 10,
                               age_sampling = "stratified",
                               age_length_group = 1,
                               select_by_age = TRUE,
-                              l50 = 15,
-                              l95 = 20,
+                              l50 = 35,
+                              l95 = 46,
                               length_max = 120,
                               age_space_group = "division",
                               custom_sets = NULL,
                               light = TRUE,
                               between_tow_var = FALSE,
-                              bt_cv = 0.08) {
+                              bt_cv = 0.08
+                              ) {
 
   n <- age <- id <- division <- strat <- N <- n_measured <- n_aged <- NULL
 
@@ -246,9 +234,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                      n_sims = n_sims,
                      trawl_dim = trawl_dim,
                      set_den = set_den,
-                     min_sets = min_sets,
-                     between_tow_var = between_tow_var,
-                     bt_cv = bt_cv)
+                     min_sets = min_sets)
   } else {
     sets <- as.data.table(custom_sets)
     if (any(duplicated(sets$set))) {
@@ -256,14 +242,13 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     }
   }
   setkeyv(sets, c("sim", "year", "cell"))
-  lak <- sim$sim_length(age = sim$ages, length_age_key = TRUE)
 
-  # availability at age
+  ## Calculate availability at age
+  lak <- sim$sim_length(age = sim$ages, length_age_key = TRUE)
   I <- sim$N * q(replicate(length(sim$years), sim$ages))
 
+  #-------------------- SAMPLE BY AGE as in original sim_survey --------------------#
   if (select_by_age ==TRUE) {
-
-    ### SAMPLE BY AGE as in original sim_survey###
 
     ## Deterministic from convert_N
     I_at_length <- convert_N(N_at_age = I, lak = lak)
@@ -277,22 +262,28 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     sp_I <- sp_I[i, ]
     sp_I$sim <- s
 
-    ## Subset population to surveyed cells and simulate portion caught by survey
-    ## Introduce sampling error using rbinom
-    ## (If more than one set is conducted in a cell, split population among sets)
+    # Set tow_area as constant or with gamma variation
+    if (between_tow_var) {
+      mean_tow_area <- prod(trawl_dim)
+      shape <- 1 / bt_cv^2
+      scale <- 1 / shape
+      tow_mult <- rgamma(nrow(sets), shape = shape, scale = scale)
+      sets[, tow_area := mean_tow_area * tow_mult]
+    }
+
+    ## Merge sets and sp_I
     setdet <- merge(sets, sp_I, by = c("sim", "year", "cell"))
 
     if (binom_error) {
-      setdet$n <- rbinom(
-        n = nrow(setdet),
-        size = round(setdet$N / pmax(setdet$cell_sets, 1)),  # avoid divide by 0
-        prob = pmin(setdet$tow_area / setdet$cell_area, 1) * q(setdet$age)
-      )
+      setdet$n <- stats::rbinom(n = rep(1, nrow(setdet)),
+                                size = round(setdet$N / setdet$cell_sets),
+                                prob = (setdet$tow_area / setdet$cell_area) * q(setdet$age)
+                                )
     } else {
       setdet$n <- round(
-        (setdet$N / pmax(setdet$cell_sets, 1)) *
-          pmin(setdet$tow_area / setdet$cell_area, 1) * q(setdet$age)
-      )
+        (setdet$N / setdet$cell_sets) *
+          ((setdet$tow_area / setdet$cell_area) * q(setdet$age))
+        )
     }
 
     setkeyv(setdet, "set")
@@ -300,23 +291,20 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     rm(sp_I)
 
     ## Expand set catch to individuals and simulate length
-    samp <- setdet[rep(seq(.N), n), list(set, age)]
-    samp$id <- seq(nrow(samp))
+    samp <- setdet[rep(seq_len(.N), n), list(set, age)]
+    samp$id <- seq_len(nrow(samp))
     samp$length <- sim$sim_length(samp$age)
 
     ## Sample lengths
-    measured <- samp[, list(id = id[sample(.N, ifelse(.N > lengths_cap, lengths_cap, .N),
-                                           replace = FALSE)]), by = "set"]
-    samp$measured <- samp$id %in% measured$id # tag lengths collected
+    measured <- samp[, .(id = id[sample(.N, min(.N, lengths_cap), replace = FALSE)]), by = set]
+    samp$measured <- samp$id %in% measured$id
     length_samp <- samp[samp$measured, ]
     rm(measured)
 
-    length_samp <- merge(sets[, .(set, sim, year, division, strat)], length_samp, by = "set")
-
-    ## Assign length groups
-    length_samp$length_group <- group_lengths(length_samp$length, age_length_group)
-
     ## Sample ages
+    length_samp$length_group <- group_lengths(length_samp$length, age_length_group)
+    length_samp <- merge(sets[, list(set, sim, year, division, strat)], length_samp, by = "set")
+
     if (age_sampling == "stratified") {
       aged <- length_samp[, list(id = id[sample(.N, ifelse(.N > ages_cap, ages_cap, .N),
                                                 replace = FALSE)]),
@@ -327,25 +315,32 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
                                                 replace = FALSE)]),
                           by = c("set")]
     }
-    samp$aged <- samp$id %in% aged$id # tag ages sampled
-    rm(aged)
-    rm(length_samp)
+
+    samp$aged <- samp$id %in% aged$id
+    rm(aged, length_samp)
 
     ## Simplify samp object
     samp <- samp[, list(set, id, length, age, measured, aged)]
     if (light) samp$id <- NULL
 
-    ## Summarise set catch and sampling
+    ## Summarize set catch and sampling
     if (!light) full_setdet <- setdet
     setdet <- merge(sets, setdet[, list(N = sum(N), n = sum(n)), by = "set"], by = "set")
     setdet <- merge(setdet,
                     samp[, list(n_measured = sum(measured), n_aged = sum(aged)), by = "set"],
                     by = "set", all.x = TRUE)
+    setdet$n_measured[is.na(setdet$n_measured)] <- 0
+    setdet$n_aged[is.na(setdet$n_aged)] <- 0
+    setdet$n[is.na(setdet$n)] <- 0
+
   } else {
 
-    #################################### SAMPLE BY LENGTH ####################################
+  ## -------------------------- SAMPLE BY LENGTH-------------------------- ##
 
     ## Initialize I_at_length tally
+    q_length <- sim_logistic(k = log(19)/(l95-l50),
+                             x0 = l50)
+
     q_vals <- q_length(as.numeric(rownames(lak)))
     q_lak <- sweep(lak, 1, q_vals, `*`)  # q(length) * p(length | age)
     I_at_length <- q_lak %*% sim$N
@@ -361,28 +356,36 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     cells_sampled <- unique(sets[, .(sim, year, cell)])
     sp_N <- merge(sp_N, cells_sampled, by = c("sim", "year", "cell"))
 
-    ## adds cell area based on resolution for catchability scaling
+    ## Add cell area based on resolution for catchability scaling
     grid_info <- as.data.table(sim$grid)
     grid_info[, cell_area := prod(stars::st_res(sim$grid))]
 
-    # joins survey set info
+    if (between_tow_var) {
+      mean_tow_area <- prod(trawl_dim)
+      shape <- 1 / bt_cv^2
+      scale <- 1 / shape
+      tow_mult <- rgamma(nrow(sets), shape = shape, scale = scale)
+      sets[, tow_area := mean_tow_area * tow_mult]
+    } else {
+      sets[, tow_area := prod(trawl_dim)]
+    }
+
+    # Join survey set info
     sp_N <- merge(sp_N, grid_info[, .(cell, cell_area)], by = "cell", all.x = TRUE)
     sp_N <- merge(sp_N, sets[, .(sim, year, cell, set, tow_area, cell_sets,
                                  x, y, division, strat)],
                   by = c("sim", "year", "cell"), allow.cartesian = TRUE)
 
-    # Pre-extract required objects for consistency
-    length_bins <- as.numeric(rownames(lak))  # same as used in I_at_length
-    q_l <- q_length(length_bins)              # selectivity at length bin midpoints
+    # Pre-extract required objects
+    length_bins <- as.numeric(rownames(lak))  # length bin midpoints
+    q_l <- q_length(length_bins)              # selectivity at length
     names(q_l) <- as.character(length_bins)
-
-    length_group_size <- get("length_group", envir = environment(sim$sim_length))
 
     # Pre-compute P(l|a) for the loop
     p_length_given_age <- setNames(
-                            lapply(unique(sp_N$age), function(a) lak[, as.character(a)]),
-                            as.character(unique(sp_N$age))
-                          )
+      lapply(unique(sp_N$age), function(a) lak[, as.character(a)]),
+      as.character(unique(sp_N$age))
+    )
 
     samp_list <- vector("list", nrow(sp_N))
 
@@ -394,25 +397,27 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
       age_char <- as.character(row$age)
       p_length <- p_length_given_age[[age_char]]
 
-      lengths <- sample(length_bins,
-                        size = N_fish,
-                        replace = TRUE,
-                        prob = p_length)
+      # Expected fish in each length bin
+      N_per_bin <- round(N_fish * p_length)
 
-      catch_probs <- (row$tow_area / row$cell_area) * q_l[as.character(lengths)]
+      # Binomial draw for each length bin
+      p_catch_bin <- pmin(1, (row$tow_area / row$cell_area) * q_l)
+      n_caught_per_bin <- rbinom(length(length_bins),
+                                 size = N_per_bin,
+                                 prob = p_catch_bin)
 
-      caught <- runif(N_fish) < pmin(1, catch_probs)
-      n_caught <- sum(caught)
-      if (n_caught == 0) next
+      if (sum(n_caught_per_bin) == 0) next
 
+      # Expand caught fish into samp_list
+      caught_bins <- which(n_caught_per_bin > 0)
       samp_list[[i]] <- data.table(
         set = row$set,
         sim = row$sim,
         year = row$year,
         division = row$division,
         strat = row$strat,
-        age = rep(row$age, n_caught),
-        length = lengths[caught]
+        age = rep(row$age, sum(n_caught_per_bin)),
+        length = rep(length_bins[caught_bins], n_caught_per_bin[caught_bins])
       )
     }
 
@@ -426,6 +431,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     samp[, measured := id %in% measured$id]
     length_samp <- samp[measured == TRUE]
     rm(measured)
+
 
     ## Sample ages
     if (age_sampling == "stratified") {
@@ -443,30 +449,44 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     samp <- samp[, list(set, id, length, age, measured, aged)]
     if (light) samp[, id := NULL]
 
-    # sim$samp <- samp
-    setdet <- merge(sets, samp[, .(n = .N, n_measured = sum(measured),
-                                   n_aged = sum(aged)), by = "set"],
-                    by = "set", all.x = TRUE)
-    sim$I_at_length <- I_at_length
+    ## Build setdet
+    set_N <- sp_N[, .(N = sum(N)), by = set]
+    set_counts <- samp[, .(n = .N, n_measured = sum(measured), n_aged = sum(aged)), by = set]
 
+    setdet <- merge(sets, set_N, by = "set", all.x = TRUE)
+    setdet <- merge(setdet, set_counts, by = "set", all.x = TRUE)
+    setdet[is.na(N), N := 0]
+    setdet[is.na(n), n := 0]
+    setdet[is.na(n_measured), n_measured := 0]
+    setdet[is.na(n_aged), n_aged := 0]
+
+    sim$samp <- samp
+    sim$I_at_length <- I_at_length
+    sim$trawl_dim <- trawl_dim
+    }
+
+  ## Ensure fixed tow area for stratified analysis
+  if (between_tow_var) {
+    fixed_tow_area <- prod(trawl_dim)
+    setdet[, tow_area := fixed_tow_area]
+    sets[, tow_area := fixed_tow_area]
   }
 
-  setdet$n_measured[is.na(setdet$n_measured)] <- 0
-  setdet$n_aged[is.na(setdet$n_aged)] <- 0
-  setdet$n[is.na(setdet$n)] <- 0
-
+  setdet <- setdet[, names(sim_survey(pop, n_sims = 1)$setdet), with = FALSE]
+  sets <- sets[, names(sim_survey(pop, n_sims = 1)$sets), with = FALSE]
 
   sim$samp_totals <- setdet[, .(n_sets = .N,
                                 n_caught = sum(n),
                                 n_measured = sum(n_measured),
-                                n_aged = sum(n_aged)
-  ), by = .(sim, year)]
+                                n_aged = sum(n_aged)),
+                            by = .(sim, year)]
 
   sim$I <- I
   sim$setdet <- setdet
   sim$samp <- samp
   sim$sets <- sets
   rownames(sim$I_at_length) <- as.numeric(rownames(sim$I_at_length))
+  attr(sim, "select_by_age") <- select_by_age
 
   return(sim)
 }
@@ -511,7 +531,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
 #' @export
 #'
 
-sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
+sim_survey_parallel_hybrid <- function(sim, n_sims = 1, n_loops = 100,
                                 cores = 1, quiet = FALSE, ...) {
 
   j <- loop <- new_set <- NULL
@@ -534,7 +554,7 @@ sim_survey_parallel <- function(sim, n_sims = 1, n_loops = 100,
   registerDoParallel(cl)
   loop_res <- foreach(j = seq(n_loops),
                       .packages = c("SimSurvey", "data.table"),
-                      .export = c("sim_survey_hybrid", "sim_logistic")) %dopar% {
+                      .export = c("sim_survey_hybrid", "sim_logistic", "sim_sets")) %dopar% {
                         res <- sim_survey_hybrid(sim, n_sims = n_sims, light = TRUE, ...)
                         keep <- c("samp_totals", "setdet", "samp")
                         loop_res <- lapply(keep, function(nm) {
