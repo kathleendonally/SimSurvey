@@ -191,7 +191,6 @@ sim_sets <- function(sim, subset_cells, n_sims = 1, trawl_dim = c(1.5, 0.02),
 
 sim_survey_hybrid <- function(sim, n_sims = 1,
                               q = sim_logistic(),
-                              # q_length = sim_logistic(k=0.589, x0=15),
                               trawl_dim = c(1.5, 0.02),
                               resample_cells = FALSE,
                               binom_error = TRUE,
@@ -472,8 +471,14 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
     sets[, tow_area := fixed_tow_area]
   }
 
-  setdet <- setdet[, names(sim_survey(pop, n_sims = 1)$setdet), with = FALSE]
-  sets <- sets[, names(sim_survey(pop, n_sims = 1)$sets), with = FALSE]
+  # setdet <- setdet[, names(sim_survey(pop, n_sims = 1)$setdet), with = FALSE]
+  # sets <- sets[, names(sim_survey(pop, n_sims = 1)$sets), with = FALSE]
+
+  samp_totals <- setdet[, .(n_sets = .N,
+                            n_caught = sum(n),
+                            n_measured = sum(n_measured),
+                            n_aged = sum(n_aged)),
+                        by = .(sim, year)]
 
   sim$samp_totals <- setdet[, .(n_sets = .N,
                                 n_caught = sum(n),
@@ -485,6 +490,7 @@ sim_survey_hybrid <- function(sim, n_sims = 1,
   sim$setdet <- setdet
   sim$samp <- samp
   sim$sets <- sets
+  sim$samp_totals <- samp_totals
   rownames(sim$I_at_length) <- as.numeric(rownames(sim$I_at_length))
   attr(sim, "select_by_age") <- select_by_age
 
@@ -554,7 +560,7 @@ sim_survey_parallel_hybrid <- function(sim, n_sims = 1, n_loops = 100,
   registerDoParallel(cl)
   loop_res <- foreach(j = seq(n_loops),
                       .packages = c("SimSurvey", "data.table"),
-                      .export = c("sim_survey_hybrid", "sim_logistic", "sim_sets")) %dopar% {
+                      .export = c("sim_survey_hybrid")) %dopar% {
                         res <- sim_survey_hybrid(sim, n_sims = n_sims, light = TRUE, ...)
                         keep <- c("samp_totals", "setdet", "samp")
                         loop_res <- lapply(keep, function(nm) {
@@ -568,13 +574,9 @@ sim_survey_parallel_hybrid <- function(sim, n_sims = 1, n_loops = 100,
   stopCluster(cl) # stop parallel process
 
   ## Combine objects from loop
-  message("Combining samp_totals...")
   samp_totals <- data.table::rbindlist(lapply(loop_res, `[[`, "samp_totals"))
-  message("Combining setdet...")
   setdet <- data.table::rbindlist(lapply(loop_res, `[[`, "setdet"))
-  message("Combining samp...")
   samp <- data.table::rbindlist(lapply(loop_res, `[[`, "samp"))
-  message("Merge complete.")
 
   ## Fix numbering
   samp_totals$new_sim <- samp_totals$sim + (samp_totals$loop * n_sims - n_sims)
@@ -590,10 +592,9 @@ sim_survey_parallel_hybrid <- function(sim, n_sims = 1, n_loops = 100,
   setnames(setdet, "new_set", "set")
   setnames(samp, "new_set", "set")
 
-  ## Add to main object
+  ## Add new stuff to main object
   sim$I <- one_res$I
   sim$I_at_length <- one_res$I_at_length
-  # sim$I_at_length_det <- one_res$I_at_length_det
   sim$setdet <- setdet
   sim$samp <- samp
   sim$samp_totals <- samp_totals
